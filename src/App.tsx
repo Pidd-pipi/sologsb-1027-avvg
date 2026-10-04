@@ -16,19 +16,28 @@ import {
   Tag,
   TextArea
 } from '@blueprintjs/core';
+import {
+  ReviewSession,
+  Reviewer,
+  ReviewComment,
+  MAX_SEATS_PER_STEP,
+  REQUIRED_CONFIRMATIONS,
+  KNOWN_REVIEWERS,
+  getCurrentReviewer,
+  computeStepHash,
+  initSession,
+  syncSession,
+  claimSeat,
+  confirmStep,
+  returnStep,
+  invalidateStep,
+  dedupeComments,
+  mergeSessions
+} from './reviewSession';
 
 type StepStatus = 'draft' | 'submitted' | 'confirmed' | 'returned';
 type ProcessStatus = 'draft' | 'in-review' | 'frozen' | 'revising';
 type ViewId = 'editor' | 'review' | 'compare';
-
-interface ReviewComment {
-  id: string;
-  author: string;
-  role: string;
-  text: string;
-  createdAt: string;
-  resolved: boolean;
-}
 
 interface ProcessStep {
   id: string;
@@ -44,7 +53,7 @@ interface ProcessStep {
   safetyNote: string;
   expectedResult: string;
   status: StepStatus;
-  comments: ReviewComment[];
+  version: number;
 }
 
 interface VersionSnapshot {
@@ -55,6 +64,7 @@ interface VersionSnapshot {
   note: string;
   author: string;
   steps: ProcessStep[];
+  reviewSession: ReviewSession;
 }
 
 interface ExperimentProcess {
@@ -68,6 +78,7 @@ interface ExperimentProcess {
   version: string;
   steps: ProcessStep[];
   versions: VersionSnapshot[];
+  reviewSession: ReviewSession;
   frozenAt?: string;
   updatedAt: string;
 }
@@ -86,8 +97,6 @@ interface DiffItem {
 }
 
 const STORAGE_KEY = 'sologsb-1027-lab-safety-v1';
-const CURRENT_AUTHOR = '周宁';
-const CURRENT_ROLE = '安全复核员';
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 function uid(prefix: string): string {
@@ -101,58 +110,80 @@ function initialProcess(): ExperimentProcess {
       materials: '无水乙醇、去离子水', equipment: '通风柜、防爆柜、标签打印机', amount: '乙醇 120 mL；去离子水 300 mL',
       duration: 15, hazards: ['易燃液体'], controls: '在通风柜内取用，远离点火源；使用接地金属容器。',
       dependencies: [], safetyNote: '操作人员需佩戴护目镜和防化手套。', expectedResult: '试剂标签、数量和有效期均核对无误。',
-      status: 'confirmed', comments: [
-        { id: 'c-1', author: '李明', role: '研究员', text: '已核对批号和有效期，防爆柜温度记录正常。', createdAt: '2026-09-24T09:10:00+08:00', resolved: true }
-      ]
+      status: 'confirmed', version: 1
     },
     {
       id: 'step-2', title: '搭建恒温循环装置', purpose: '连接循环浴与反应夹套，检查密封和温控。',
       materials: '无', equipment: '恒温循环浴、硅胶管、反应夹套、扎带', amount: '循环液 800 mL',
       duration: 25, hazards: ['烫伤', '管路脱落'], controls: '管路双端固定；升温前完成 5 分钟试压并设置独立超温断电。',
       dependencies: ['step-1'], safetyNote: '高温表面设置警示标识，循环浴周围保持干燥。', expectedResult: '30 分钟内温度稳定在 55 ± 0.5 ℃。',
-      status: 'confirmed', comments: [
-        { id: 'c-2', author: '王颖', role: '安全复核员', text: '补充超温断电值，不能只依赖设备自带温控。', createdAt: '2026-09-24T10:05:00+08:00', resolved: true }
-      ]
+      status: 'confirmed', version: 1
     },
     {
       id: 'step-3', title: '加入催化剂并启动反应', purpose: '按批次加入催化剂，记录起点并开始计时。',
       materials: '催化剂 A', equipment: '分析天平、加料漏斗、计时器', amount: '催化剂 A 2.50 ± 0.02 g',
       duration: 20, hazards: ['粉尘吸入', '放热反应'], controls: '在通风柜内称量，佩戴 N95 口罩；分三次少量加入并监测温度。',
       dependencies: ['step-2'], safetyNote: '反应温度超过 70 ℃ 时立即停止加料并启动冷却。', expectedResult: '温度缓慢升至 62–66 ℃，无明显冲料。',
-      status: 'submitted', comments: []
+      status: 'submitted', version: 1
     },
     {
       id: 'step-4', title: '恒温反应与过程取样', purpose: '维持温度并定时取样观察反应转化。',
       materials: '样品瓶、惰性气体', equipment: '取样针、气相色谱、恒温循环浴', amount: '每点样品约 1 mL，共 6 点',
       duration: 90, hazards: ['高温液体', '挥发性气体'], controls: '取样前泄压；使用长针和防护屏；样品瓶及时封闭。',
       dependencies: ['step-3'], safetyNote: '取样时不得正对瓶口，样品瓶不得完全密封后加热。', expectedResult: '转化率达到 95% 以上且无异常副产物。',
-      status: 'submitted', comments: []
+      status: 'submitted', version: 1
     },
     {
       id: 'step-5', title: '停止加热并冷却', purpose: '终止反应并将体系降至安全温度。',
       materials: '无', equipment: '循环浴、温度探头', amount: '降温目标 ≤ 30 ℃', duration: 35,
       hazards: ['烫伤', '残余反应'], controls: '先停止加料并维持搅拌，再以不超过 1 ℃/min 的速率降温。',
       dependencies: ['step-4'], safetyNote: '确认温度连续 5 分钟低于 30 ℃ 后才能拆除装置。', expectedResult: '体系温度稳定低于 30 ℃。',
-      status: 'draft', comments: []
+      status: 'draft', version: 1
     },
     {
       id: 'step-6', title: '废液分类与现场恢复', purpose: '按危险废物要求分类收集并恢复实验区域。',
       materials: '废液桶、吸附棉', equipment: '防化手套、护目镜、危废标签', amount: '按实际产生量记录', duration: 25,
       hazards: ['废液混装', '化学暴露'], controls: '有机废液单独收集，核对相容性后贴标签；泄漏吸附材料按危废处置。',
       dependencies: ['step-5'], safetyNote: '废液不得倒入下水道，现场恢复后完成双人确认。', expectedResult: '废液交接记录完整，台面无残留。',
-      status: 'draft', comments: []
+      status: 'draft', version: 1
     }
   ];
+
+  // 复核批注从步骤迁移到会话
+  const seedComments: Record<string, ReviewComment[]> = {
+    'step-1': [
+      { id: 'c-1', author: '李明', role: '研究员', text: '已核对批号和有效期，防爆柜温度记录正常。', createdAt: '2026-09-24T09:10:00+08:00', resolved: true }
+    ],
+    'step-2': [
+      { id: 'c-2', author: '王颖', role: '安全复核员', text: '补充超温断电值，不能只依赖设备自带温控。', createdAt: '2026-09-24T10:05:00+08:00', resolved: true }
+    ]
+  };
+
+  const session = initSession(baseSteps.map((s) => s.id));
+  baseSteps.forEach((step) => {
+    const state = session.stepStates[step.id];
+    state.contentHash = computeStepHash(step);
+    state.comments = seedComments[step.id] ?? [];
+    if (step.status === 'confirmed') {
+      state.status = 'confirmed';
+      state.confirmations = [
+        { id: uid('conf'), reviewerId: 'rev-wang', reviewerName: '王颖', stepVersion: 1, contentHash: state.contentHash, confirmedAt: '2026-09-24T11:00:00+08:00', valid: true },
+        { id: uid('conf'), reviewerId: 'rev-li', reviewerName: '李明', stepVersion: 1, contentHash: state.contentHash, confirmedAt: '2026-09-24T11:05:00+08:00', valid: true }
+      ];
+    }
+  });
 
   const firstVersion: VersionSnapshot = {
     id: 'version-1-0', label: '首版批准流程', version: '1.0.0', createdAt: '2026-09-20T14:30:00+08:00',
     note: '建立基础反应与取样步骤。', author: '王颖',
-    steps: clone(baseSteps).slice(0, 4).map((step) => ({ ...step, status: 'confirmed', comments: [] }))
+    steps: clone(baseSteps).slice(0, 4).map((step) => ({ ...step, status: 'confirmed' })),
+    reviewSession: clone(session)
   };
   const secondVersion: VersionSnapshot = {
     id: 'version-1-1', label: '补充冷却与废液步骤', version: '1.1.0', createdAt: '2026-09-24T15:10:00+08:00',
     note: '增加安全冷却、废液处置和现场恢复。', author: '王颖',
-    steps: clone(baseSteps).map((step) => ({ ...step, status: 'confirmed', comments: [] }))
+    steps: clone(baseSteps).map((step) => ({ ...step, status: 'confirmed' })),
+    reviewSession: clone(session)
   };
 
   return {
@@ -160,7 +191,8 @@ function initialProcess(): ExperimentProcess {
     objective: '在受控温度下评价催化剂活性，并完整记录过程样品与安全控制措施。',
     principal: '李明', lab: '材料化学实验室 B-207',
     status: 'in-review', version: '1.2.0-draft',
-    steps: baseSteps, versions: [firstVersion, secondVersion], updatedAt: new Date().toISOString()
+    steps: baseSteps, versions: [firstVersion, secondVersion], reviewSession: session,
+    updatedAt: new Date().toISOString()
   };
 }
 
@@ -168,6 +200,7 @@ function historyReducer(state: HistoryState, action:
   | { type: 'commit'; update: (draft: ExperimentProcess) => void }
   | { type: 'undo' }
   | { type: 'redo' }
+  | { type: 'merge'; remote: ExperimentProcess }
   | { type: 'reset'; value: ExperimentProcess }
 ): HistoryState {
   if (action.type === 'commit') {
@@ -186,7 +219,37 @@ function historyReducer(state: HistoryState, action:
     if (!next) return state;
     return { past: [...state.past, clone(state.present)].slice(-60), present: next, future: state.future.slice(1) };
   }
+  if (action.type === 'merge') {
+    const merged = mergeProcesses(state.present, action.remote);
+    merged.updatedAt = new Date().toISOString();
+    return { past: state.past, present: merged, future: [] };
+  }
   return { past: [], present: action.value, future: [] };
+}
+
+// 合并本地与远程流程（内容按版本取较新，会话取并集）
+function mergeProcesses(local: ExperimentProcess, remote: ExperimentProcess): ExperimentProcess {
+  const localSteps = new Map<string, ProcessStep>(local.steps.map((s) => [s.id, s]));
+  const remoteSteps = new Map<string, ProcessStep>(remote.steps.map((s) => [s.id, s]));
+  const mergedSteps: ProcessStep[] = [];
+  const allIds = new Set([...localSteps.keys(), ...remoteSteps.keys()]);
+  for (const id of allIds) {
+    const l = localSteps.get(id);
+    const r = remoteSteps.get(id);
+    if (l && r) mergedSteps.push(l.version >= r.version ? l : r);
+    else if (l) mergedSteps.push(l);
+    else if (r) mergedSteps.push(r);
+  }
+  const mergedSession = mergeSessions(local.reviewSession, remote.reviewSession);
+  const versionMap = new Map<string, VersionSnapshot>();
+  [...local.versions, ...remote.versions].forEach((v) => { if (!versionMap.has(v.id)) versionMap.set(v.id, v); });
+  return {
+    ...local,
+    steps: mergedSteps,
+    reviewSession: mergedSession,
+    versions: [...versionMap.values()],
+    status: remote.status === 'frozen' && local.status !== 'frozen' ? 'frozen' : local.status
+  };
 }
 
 function loadProcess(): ExperimentProcess {
@@ -194,7 +257,28 @@ function loadProcess(): ExperimentProcess {
     const value = localStorage.getItem(STORAGE_KEY);
     if (!value) return initialProcess();
     const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    if (!parsed.id || !Array.isArray(parsed.steps)) return initialProcess();
+    // 迁移：确保会话存在
+    if (!parsed.reviewSession || !parsed.reviewSession.stepStates) {
+      const session = initSession(parsed.steps.map((s) => s.id));
+      parsed.steps.forEach((step) => {
+        const state = session.stepStates[step.id];
+        state.contentHash = computeStepHash(step);
+        if (step.status === 'confirmed') {
+          state.status = 'confirmed';
+          state.confirmations = [
+            { id: uid('conf'), reviewerId: 'rev-wang', reviewerName: '王颖', stepVersion: step.version ?? 1, contentHash: state.contentHash, confirmedAt: new Date().toISOString(), valid: true },
+            { id: uid('conf'), reviewerId: 'rev-li', reviewerName: '李明', stepVersion: step.version ?? 1, contentHash: state.contentHash, confirmedAt: new Date().toISOString(), valid: true }
+          ];
+        }
+      });
+      parsed.reviewSession = session;
+    }
+    // 迁移：确保步骤有 version 字段
+    parsed.steps.forEach((step) => {
+      if (typeof step.version !== 'number') step.version = 1;
+    });
+    return parsed;
   } catch {
     return initialProcess();
   }
@@ -230,7 +314,13 @@ function App() {
   const [online, setOnline] = useState(true);
   const [compareBaseId, setCompareBaseId] = useState(process.versions[0]?.id ?? '');
   const [compareTargetId, setCompareTargetId] = useState(process.versions.at(-1)?.id ?? '');
+  const [currentReviewer, setCurrentReviewer] = useState<Reviewer>(() => getCurrentReviewer());
+  const [crossTabSync, setCrossTabSync] = useState(true);
+  const [simulateConcurrent, setSimulateConcurrent] = useState(false);
+  const [pendingMerge, setPendingMerge] = useState(false);
+  const [lastMergeAt, setLastMergeAt] = useState<string | null>(null);
   const initialSaveSkipped = useRef(false);
+  const syncLock = useRef(false);
 
   const selectedStep = process.steps.find((step) => step.id === selectedStepId) ?? process.steps[0];
   const downstreamIds = useMemo(() => collectDownstream(process.steps, lastModifiedId), [process.steps, lastModifiedId]);
@@ -238,6 +328,7 @@ function App() {
   const missingSafetySteps = process.steps.filter(hasMissingSafety);
   const pendingReviewCount = process.steps.filter((step) => step.status === 'submitted' || step.status === 'returned').length;
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
+  const hasInvalidatedSteps = Object.values(process.reviewSession.stepStates).some((s) => s.status === 'invalidated');
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
   const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
 
@@ -281,6 +372,55 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeydown);
   }, [process]);
 
+  // 跨标签页同步：监听 storage 事件，合并远程状态
+  useEffect(() => {
+    if (!crossTabSync) return;
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== STORAGE_KEY || !event.newValue) return;
+      if (syncLock.current) return;
+      try {
+        const remote = JSON.parse(event.newValue) as ExperimentProcess;
+        if (!remote.id || !remote.reviewSession) return;
+        syncLock.current = true;
+        dispatch({ type: 'merge', remote });
+        setLastMergeAt(new Date().toISOString());
+        setSavedLabel(`已合并其他标签页修改 · ${formatDate(new Date().toISOString())}`);
+        setTimeout(() => { syncLock.current = false; }, 300);
+      } catch { /* ignore */ }
+    };
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, [crossTabSync]);
+
+  // 联网后合并离线修改
+  useEffect(() => {
+    if (!online) {
+      setPendingMerge(true);
+      return;
+    }
+    if (!pendingMerge) return;
+    // 联网：读取远程并合并
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const remote = JSON.parse(raw) as ExperimentProcess;
+        if (remote.id && remote.reviewSession) {
+          dispatch({ type: 'merge', remote });
+          setLastMergeAt(new Date().toISOString());
+          setSavedLabel(`离线修改已合并 · ${formatDate(new Date().toISOString())}`);
+        }
+      }
+    } catch { /* ignore */ }
+    setPendingMerge(false);
+  }, [online, pendingMerge]);
+
+  // 切换复核员身份
+  const switchReviewer = (reviewer: Reviewer): void => {
+    setCurrentReviewer(reviewer);
+    sessionStorage.setItem('sologsb-1027-reviewer-v1', JSON.stringify(reviewer));
+    setSavedLabel(`当前复核员：${reviewer.name}`);
+  };
+
   const commitProcess = (update: (draft: ExperimentProcess) => void): void => {
     dispatch({ type: 'commit', update });
   };
@@ -295,7 +435,15 @@ function App() {
     setLastModifiedId(id);
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
-      if (step) (step as unknown as Record<string, unknown>)[field] = value;
+      if (!step) return;
+      (step as unknown as Record<string, unknown>)[field] = value;
+      // 内容变更 → 递增版本号，该步骤及下游确认失效
+      step.version += 1;
+      const downstream = collectDownstream(draft.steps, id);
+      draft.reviewSession = invalidateStep(draft.reviewSession, id, `步骤内容变更（${field}）`, downstream);
+      // 同步步骤缓存状态
+      syncStepStatus(draft, id);
+      downstream.forEach((depId) => syncStepStatus(draft, depId));
     });
   };
 
@@ -310,9 +458,10 @@ function App() {
       draft.steps.push({
         id, title: '新的实验步骤', purpose: '', materials: '', equipment: '', amount: '', duration: 10,
         hazards: [], controls: '', dependencies: draft.steps.at(-1) ? [draft.steps.at(-1)!.id] : [],
-        safetyNote: '', expectedResult: '', status: 'draft', comments: []
+        safetyNote: '', expectedResult: '', status: 'draft', version: 1
       });
       draft.status = 'draft';
+      draft.reviewSession = syncSession(draft.reviewSession, draft.steps);
     });
     setSelectedStepId(id);
     setLastModifiedId(id);
@@ -325,11 +474,12 @@ function App() {
     copy.id = uid('step');
     copy.title = `${copy.title}（副本）`;
     copy.status = 'draft';
-    copy.comments = [];
+    copy.version = 1;
     copy.dependencies = [...copy.dependencies];
     commitProcess((draft) => {
       const index = draft.steps.findIndex((step) => step.id === selectedStep.id);
       draft.steps.splice(index + 1, 0, copy);
+      draft.reviewSession = syncSession(draft.reviewSession, draft.steps);
     });
     setSelectedStepId(copy.id);
   };
@@ -340,6 +490,7 @@ function App() {
     commitProcess((draft) => {
       draft.steps = draft.steps.filter((step) => step.id !== id);
       draft.steps.forEach((step) => { step.dependencies = step.dependencies.filter((dependency) => dependency !== id); });
+      delete draft.reviewSession.stepStates[id];
     });
     setSelectedStepId(process.steps.find((step) => step.id !== id)?.id ?? '');
   };
@@ -381,34 +532,161 @@ function App() {
     if (!selectedStep || !commentText.trim()) return;
     const id = selectedStep.id;
     commitProcess((draft) => {
-      const step = draft.steps.find((item) => item.id === id);
-      step?.comments.push({
-        id: uid('comment'), author: CURRENT_AUTHOR, role: CURRENT_ROLE,
-        text: commentText.trim(), createdAt: new Date().toISOString(), resolved: false
-      });
+      const state = draft.reviewSession.stepStates[id];
+      if (!state) return;
+      state.comments = dedupeComments([
+        ...state.comments,
+        { id: uid('comment'), author: currentReviewer.name, role: currentReviewer.role,
+          text: commentText.trim(), createdAt: new Date().toISOString(), resolved: false }
+      ]);
     });
     setCommentText('');
-  };
-
-  const setStepStatus = (status: StepStatus): void => {
-    if (!selectedStep) return;
-    updateStep('status', status);
-    setLastModifiedId(status === 'returned' ? selectedStep.id : null);
   };
 
   const resolveComment = (commentId: string): void => {
     if (!selectedStep) return;
     const stepId = selectedStep.id;
     commitProcess((draft) => {
-      const comment = draft.steps.find((step) => step.id === stepId)?.comments.find((item) => item.id === commentId);
+      const comment = draft.reviewSession.stepStates[stepId]?.comments.find((item) => item.id === commentId);
       if (comment) comment.resolved = !comment.resolved;
     });
   };
 
+  // 领取复核席位
+  const claimSeatForReview = (): void => {
+    if (!selectedStep) return;
+    const id = selectedStep.id;
+    const now = Date.now();
+    commitProcess((draft) => {
+      const state = draft.reviewSession.stepStates[id];
+      if (!state) return;
+      const { result, state: next } = claimSeat(state, currentReviewer, state.stepVersion, now);
+      draft.reviewSession.stepStates[id] = next;
+      draft.reviewSession.version += 1;
+      if (result.status === 'queued') {
+        setSavedLabel(`席位已满，已排队（第 ${result.position} 位）`);
+      } else if (result.status === 'claimed') {
+        setSavedLabel('已领取复核席位');
+      } else if (result.status === 'version-conflict') {
+        setSavedLabel(`版本冲突：当前步骤已更新到 v${result.currentStepVersion}`);
+      } else {
+        setSavedLabel(`席位已满，排队第 ${result.position} 位`);
+      }
+    });
+    simulateCompetingReviewer(id);
+  };
+
+  // 确认步骤（核对版本、前置依赖、席位）
+  const confirmStepForReview = (): void => {
+    if (!selectedStep) return;
+    const id = selectedStep.id;
+    const now = Date.now();
+    const draft = commentText.trim();
+    commitProcess((draftProc) => {
+      const state = draftProc.reviewSession.stepStates[id];
+      if (!state) return;
+      const step = draftProc.steps.find((s) => s.id === id);
+      if (!step) return;
+      const dependencyStates = step.dependencies.map((depId) => {
+        const depState = draftProc.reviewSession.stepStates[depId];
+        return { depId, confirmed: depState?.status === 'confirmed' };
+      });
+      const { result, state: next } = confirmStep(state, currentReviewer, state.stepVersion, dependencyStates, now);
+      draftProc.reviewSession.stepStates[id] = next;
+      draftProc.reviewSession.version += 1;
+      if (result.status === 'confirmed') {
+        // 同步步骤缓存状态
+        syncStepStatus(draftProc, id);
+        setSavedLabel('步骤已确认');
+        setCommentText('');
+      } else if (result.status === 'version-conflict') {
+        // 领取失败：保留草稿，记录重试位置
+        state.pendingDraft = { text: draft, failedAt: new Date().toISOString(), reason: `版本冲突，当前 v${result.currentStepVersion}`, expectedVersion: state.stepVersion };
+        setSavedLabel(`版本冲突，草稿已保留（当前 v${result.currentStepVersion}）`);
+      } else if (result.status === 'prerequisite-missing') {
+        setSavedLabel(`前置依赖未确认：${result.missingDepId}`);
+      } else if (result.status === 'queued') {
+        state.pendingDraft = { text: draft, failedAt: new Date().toISOString(), reason: `席位已满，排队第 ${result.position} 位`, expectedVersion: state.stepVersion };
+        setSavedLabel(`席位已满，已排队（第 ${result.position} 位），草稿已保留`);
+      } else {
+        state.pendingDraft = { text: draft, failedAt: new Date().toISOString(), reason: '席位已满', expectedVersion: state.stepVersion };
+        setSavedLabel('席位已满，草稿已保留');
+      }
+    });
+    simulateCompetingReviewer(id);
+  };
+
+  // 退回步骤
+  const returnStepForReview = (): void => {
+    if (!selectedStep) return;
+    const id = selectedStep.id;
+    const now = Date.now();
+    commitProcess((draft) => {
+      const state = draft.reviewSession.stepStates[id];
+      if (!state) return;
+      const { state: next } = returnStep(state, currentReviewer, state.stepVersion, now);
+      draft.reviewSession.stepStates[id] = next;
+      draft.reviewSession.version += 1;
+      syncStepStatus(draft, id);
+      setLastModifiedId(id);
+      setSavedLabel('步骤已退回');
+    });
+  };
+
+  // 重试待处理草稿
+  const retryPendingDraft = (): void => {
+    if (!selectedStep) return;
+    const id = selectedStep.id;
+    commitProcess((draft) => {
+      const state = draft.reviewSession.stepStates[id];
+      if (!state?.pendingDraft) return;
+      // 清除旧草稿，重新走确认流程
+      state.pendingDraft = undefined;
+    });
+    // 重新触发确认
+    confirmStepForReview();
+  };
+
+  // 虚拟复核员并发：模拟另一位复核员同时领取同一席位
+  const simulateCompetingReviewer = (stepId: string): void => {
+    if (!simulateConcurrent) return;
+    const competitors = KNOWN_REVIEWERS.filter((r) => r.id !== currentReviewer.id);
+    const competitor = competitors[Math.floor(Math.random() * competitors.length)];
+    window.setTimeout(() => {
+      const now = Date.now();
+      commitProcess((draft) => {
+        const state = draft.reviewSession.stepStates[stepId];
+        if (!state) return;
+        const { result, state: next } = claimSeat(state, competitor, state.stepVersion, now);
+        draft.reviewSession.stepStates[stepId] = next;
+        draft.reviewSession.version += 1;
+        if (result.status === 'claimed') {
+          setSavedLabel(`虚拟复核员 ${competitor.name} 已领取同一步骤席位`);
+        } else if (result.status === 'queued') {
+          setSavedLabel(`虚拟复核员 ${competitor.name} 排队（第 ${result.position} 位）`);
+        } else {
+          setSavedLabel(`虚拟复核员 ${competitor.name} 领取失败（版本冲突 v${result.status === 'version-conflict' ? result.currentStepVersion : '?'}）`);
+        }
+      });
+    }, 800 + Math.random() * 1200);
+  };
+
+  const setStepStatus = (status: StepStatus): void => {
+    if (!selectedStep) return;
+    if (status === 'confirmed') confirmStepForReview();
+    else if (status === 'returned') returnStepForReview();
+    else {
+      updateStep('status', status);
+      setLastModifiedId(null);
+    }
+  };
+
   const freezeVersion = (): void => {
     if (process.status === 'frozen') return;
-    if (process.steps.some((step) => step.status !== 'confirmed') || missingSafetySteps.length) {
-      setSavedLabel('冻结条件未满足');
+    const allConfirmed = process.steps.every((step) => step.status === 'confirmed');
+    const hasInvalidated = Object.values(process.reviewSession.stepStates).some((s) => s.status === 'invalidated');
+    if (!allConfirmed || hasInvalidated || missingSafetySteps.length) {
+      setSavedLabel('冻结条件未满足：需全部重核确认且无安全缺口');
       return;
     }
     const nextNumber = nextMinorVersion(process.version);
@@ -418,7 +696,8 @@ function App() {
       draft.versions.push({
         id: frozenVersionId, label: '复核通过冻结版', version: nextNumber,
         createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整。`,
-        author: CURRENT_AUTHOR, steps: clone(draft.steps)
+        author: currentReviewer.name, steps: clone(draft.steps),
+        reviewSession: clone(draft.reviewSession)
       });
       draft.version = nextNumber;
       draft.status = 'frozen';
@@ -438,7 +717,13 @@ function App() {
       draft.frozenAt = undefined;
       draft.steps.forEach((step) => {
         step.status = 'draft';
-        step.comments = [];
+        step.version = 1;
+      });
+      // 新复核周期：重置会话
+      draft.reviewSession = initSession(draft.steps.map((s) => s.id));
+      draft.steps.forEach((step) => {
+        const state = draft.reviewSession.stepStates[step.id];
+        state.contentHash = computeStepHash(step);
       });
     });
     setActiveView('editor');
@@ -450,7 +735,8 @@ function App() {
       draft.versions.push({
         id: uid('version'), label: '工作版本快照', version: draft.version.replace('-draft', ''),
         createdAt: new Date().toISOString(), note: '保存当前步骤与复核状态。',
-        author: CURRENT_AUTHOR, steps: clone(draft.steps)
+        author: currentReviewer.name, steps: clone(draft.steps),
+        reviewSession: clone(draft.reviewSession)
       });
     });
     setSavedLabel('已保存工作版本快照');
@@ -461,14 +747,24 @@ function App() {
       <header className="app-header">
         <div className="brand-block">
           <div className="brand-icon"><Icon icon="lab-test" size={23} /></div>
-          <div><h1>实验流程安全复核台</h1><p>步骤影响分析 · 逐条复核 · 冻结版本</p></div>
+          <div><h1>实验流程安全复核台</h1><p>版本化复核会话 · 席位领取 · 失效重核</p></div>
         </div>
         <div className="header-status">
           <span className={`network ${online ? 'online' : ''}`}></span>
-          <span>{online ? '离线保存已启用' : '当前离线，修改仍会保存'}</span>
+          <span>{online ? '已联网' : '离线模式'}</span>
+          {pendingMerge && <Tag intent="warning" minimal>待合并</Tag>}
+          {lastMergeAt && <Tag minimal intent="success">已合并</Tag>}
           <strong>{savedLabel}</strong>
         </div>
         <div className="header-actions">
+          <HTMLSelect
+            value={currentReviewer.id}
+            onChange={(e) => {
+              const r = KNOWN_REVIEWERS.find((x) => x.id === e.target.value);
+              if (r) switchReviewer(r);
+            }}
+            options={KNOWN_REVIEWERS.map((r) => ({ value: r.id, label: `${r.name} · ${r.role}` }))}
+          />
           <Button icon="undo" text="撤销" minimal disabled={history.past.length === 0} onClick={() => dispatch({ type: 'undo' })} />
           <Button icon="redo" text="重做" minimal disabled={history.future.length === 0} onClick={() => dispatch({ type: 'redo' })} />
           <Button icon="floppy-disk" text="保存快照" onClick={addVersionSnapshot} />
@@ -476,7 +772,19 @@ function App() {
         </div>
       </header>
 
-      {!online && <Callout className="offline-callout" intent="warning" icon="cloud">网络不可用。编辑、复核和版本快照仍会保存在当前浏览器。</Callout>}
+      {!online && <Callout className="offline-callout" intent="warning" icon="cloud">网络不可用。编辑、复核和版本快照仍会保存在当前浏览器，联网后自动合并。</Callout>}
+
+      <div className="sync-bar">
+        <label className="sync-toggle">
+          <input type="checkbox" checked={crossTabSync} onChange={(e) => setCrossTabSync(e.target.checked)} />
+          <span>跨标签页同步</span>
+        </label>
+        <label className="sync-toggle">
+          <input type="checkbox" checked={simulateConcurrent} onChange={(e) => setSimulateConcurrent(e.target.checked)} />
+          <span>虚拟复核员并发（演示席位争夺）</span>
+        </label>
+        <span className="sync-hint">当前复核员：<strong style={{ color: currentReviewer.color }}>{currentReviewer.name}</strong> · 会话 v{process.reviewSession.version} · 每步需 {REQUIRED_CONFIRMATIONS} 个确认 · {MAX_SEATS_PER_STEP} 个席位</span>
+      </div>
 
       <section className="process-banner">
         <div className="banner-main">
@@ -510,13 +818,20 @@ function App() {
               <Button icon="add" minimal small onClick={addStep} disabled={process.status === 'frozen'} />
             </div>
             <div className="step-list">
-              {process.steps.map((step, index) => (
-                <button key={step.id} className={step.id === selectedStep.id ? 'selected' : ''} onClick={() => setSelectedStepId(step.id)}>
-                  <span className={`step-number ${step.status}`}>{String(index + 1).padStart(2, '0')}</span>
-                  <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)}</small></span>
-                  {hasMissingSafety(step) && <Icon icon="warning-sign" intent="danger" size={13} />}
-                </button>
-              ))}
+              {process.steps.map((step, index) => {
+                const ss = process.reviewSession.stepStates[step.id];
+                const invalidated = ss?.status === 'invalidated';
+                return (
+                  <button key={step.id} className={`${step.id === selectedStep.id ? 'selected' : ''} ${step.status} ${invalidated ? 'invalidated' : ''}`} onClick={() => setSelectedStepId(step.id)}>
+                    <span className={`step-number ${step.status}`}>{String(index + 1).padStart(2, '0')}</span>
+                    <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)} · v{ss?.stepVersion ?? 1}</small></span>
+                    <span className="step-flags">
+                      {invalidated && <Icon icon="warning-sign" intent="danger" size={13} />}
+                      {hasMissingSafety(step) && <Icon icon="warning-sign" intent="warning" size={13} />}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
             <div className="step-actions">
               <Button icon="arrow-up" small minimal disabled={process.steps[0]?.id === selectedStep.id || process.status === 'frozen'} onClick={() => moveStep(-1)} />
@@ -624,10 +939,28 @@ function App() {
             ))}
           </aside>
           <section className="review-main">
-            {selectedStep && (
+            {selectedStep && (() => {
+              const stepState = process.reviewSession.stepStates[selectedStep.id];
+              if (!stepState) return null;
+              const validConfirmations = stepState.confirmations.filter((c) => c.valid);
+              const mySeat = stepState.seats.find((s) => s.reviewerId === currentReviewer.id);
+              const myQueue = stepState.queue.find((q) => q.reviewerId === currentReviewer.id);
+              const isInvalidated = stepState.status === 'invalidated';
+              return (
               <>
                 <Card elevation={Elevation.ONE} className="review-summary">
-                  <div className="card-title"><div><span>SAFETY REVIEW</span><h3>{selectedStep.title}</h3></div><Tag intent={selectedStep.status === 'confirmed' ? 'success' : selectedStep.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(selectedStep.status)}</Tag></div>
+                  <div className="card-title"><div><span>SAFETY REVIEW</span><h3>{selectedStep.title}</h3></div>
+                    <div className="title-tags">
+                      <Tag minimal>v{stepState.stepVersion}</Tag>
+                      <Tag intent={selectedStep.status === 'confirmed' ? 'success' : selectedStep.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(selectedStep.status)}</Tag>
+                    </div>
+                  </div>
+                  {isInvalidated && (
+                    <Callout intent="danger" icon="warning-sign" className="invalidation-callout">
+                      <strong>确认已失效，需重核</strong>
+                      <p>{stepState.lastInvalidationReason ?? '步骤内容已变更'} · {stepState.lastInvalidatedAt ? formatDate(stepState.lastInvalidatedAt) : ''}</p>
+                    </Callout>
+                  )}
                   <div className="review-facts">
                     <div><span>预计时间</span><strong>{selectedStep.duration} 分钟</strong></div>
                     <div><span>材料与用量</span><strong>{selectedStep.materials} / {selectedStep.amount}</strong></div>
@@ -637,37 +970,114 @@ function App() {
                   <div className="review-section"><h4>安全说明</h4><p className={hasMissingSafety(selectedStep) ? 'danger-text' : ''}>{selectedStep.safetyNote || '未填写'}</p></div>
                   {hasMissingSafety(selectedStep) && <Callout intent="danger" icon="warning-sign">当前步骤存在安全信息缺口，不能确认或冻结版本。</Callout>}
                 </Card>
+
+                <Card elevation={Elevation.ONE} className="session-card">
+                  <div className="card-title"><div><span>REVIEW SESSION</span><h3>席位与确认</h3></div><Tag minimal>会话 v{process.reviewSession.version}</Tag></div>
+                  <div className="session-grid">
+                    <div className="session-block">
+                      <h4>已领取席位（{stepState.seats.length}/{MAX_SEATS_PER_STEP}）</h4>
+                      {stepState.seats.length ? stepState.seats.map((seat) => (
+                        <div key={seat.id} className="seat-row">
+                          <span className="seat-dot" style={{ background: KNOWN_REVIEWERS.find((r) => r.id === seat.reviewerId)?.color ?? '#888' }}></span>
+                          <strong>{seat.reviewerName}</strong>
+                          <small>{formatDate(seat.claimedAt)}</small>
+                          {seat.reviewerId === currentReviewer.id && <Tag minimal intent="primary">我</Tag>}
+                        </div>
+                      )) : <p className="muted">暂无复核员领取席位。</p>}
+                    </div>
+                    <div className="session-block">
+                      <h4>排队（{stepState.queue.length}）</h4>
+                      {stepState.queue.length ? stepState.queue.map((q) => (
+                        <div key={q.id} className="seat-row queued">
+                          <Tag minimal>第 {q.position} 位</Tag>
+                          <strong>{q.reviewerName}</strong>
+                          {q.reviewerId === currentReviewer.id && <Tag minimal intent="warning">我</Tag>}
+                        </div>
+                      )) : <p className="muted">无人排队。</p>}
+                    </div>
+                    <div className="session-block">
+                      <h4>有效确认（{validConfirmations.length}/{REQUIRED_CONFIRMATIONS}）</h4>
+                      {validConfirmations.length ? validConfirmations.map((c) => (
+                        <div key={c.id} className="seat-row">
+                          <Icon icon="tick-circle" intent="success" size={13} />
+                          <strong>{c.reviewerName}</strong>
+                          <small>v{c.stepVersion} · {formatDate(c.confirmedAt)}</small>
+                        </div>
+                      )) : <p className="muted">暂无有效确认。</p>}
+                    </div>
+                  </div>
+                  {mySeat && <Callout intent="primary" icon="endorsed" className="my-seat-callout">你已领取本步席位，请在席位有效期内完成确认。</Callout>}
+                  {myQueue && <Callout intent="warning" icon="time" className="my-seat-callout">席位已满，你在第 {myQueue.position} 位排队。席位释放后可重新领取。</Callout>}
+                </Card>
+
                 <Card elevation={Elevation.ONE} className="comment-card">
-                  <div className="card-title"><div><span>REVIEW COMMENTS</span><h3>复核批注</h3></div><Tag minimal>{selectedStep.comments.length} 条</Tag></div>
+                  <div className="card-title"><div><span>REVIEW COMMENTS</span><h3>复核批注</h3></div><Tag minimal>{stepState.comments.length} 条</Tag></div>
+                  {stepState.pendingDraft && (
+                    <Callout intent="warning" icon="warning-sign" className="pending-draft-callout">
+                      <strong>上次领取失败，草稿已保留</strong>
+                      <p>{stepState.pendingDraft.reason} · 草稿：{stepState.pendingDraft.text.slice(0, 40)}{stepState.pendingDraft.text.length > 40 ? '…' : ''}</p>
+                      <Button size="small" intent="primary" icon="refresh" text="重试领取并确认" onClick={retryPendingDraft} />
+                    </Callout>
+                  )}
                   <div className="comment-compose">
                     <TextArea fill value={commentText} onChange={(event) => setCommentText(event.target.value)} placeholder="填写具体依据、风险或修改建议…" />
                     <Button intent="primary" icon="comment" text="添加批注" disabled={!commentText.trim()} onClick={addReviewComment} />
                   </div>
                   <div className="comment-list">
-                    {selectedStep.comments.map((comment) => (
+                    {stepState.comments.map((comment) => (
                       <article key={comment.id} className={comment.resolved ? 'resolved' : ''}>
-                        <div className="comment-avatar">{comment.author.slice(0, 1)}</div>
+                        <div className="comment-avatar" style={{ background: KNOWN_REVIEWERS.find((r) => r.name === comment.author)?.color ?? '#3c6588' }}>{comment.author.slice(0, 1)}</div>
                         <div><header><strong>{comment.author}</strong><span>{comment.role}</span><time>{formatDate(comment.createdAt)}</time></header><p>{comment.text}</p><Button minimal small text={comment.resolved ? '已解决' : '标记解决'} icon={comment.resolved ? 'tick' : 'circle'} onClick={() => resolveComment(comment.id)} /></div>
                       </article>
                     ))}
-                    {!selectedStep.comments.length && <p className="muted">当前步骤尚未添加复核批注。</p>}
+                    {!stepState.comments.length && <p className="muted">当前步骤尚未添加复核批注。</p>}
                   </div>
                 </Card>
               </>
-            )}
+              );
+            })()}
           </section>
           <aside className="review-actions">
             <Card elevation={Elevation.ONE}>
               <div className="card-title"><div><span>REVIEWER ACTION</span><h3>复核决定</h3></div><Icon icon="endorsed" size={18} /></div>
-              <p className="muted">确认后若修改该步骤，受影响的下游步骤会在编辑页重新提示。</p>
-              <Button fill large intent="success" icon="tick" text="逐条确认" disabled={hasMissingSafety(selectedStep)} onClick={() => setStepStatus('confirmed')} />
-              <Button fill large icon="undo" text="退回修改" intent="warning" onClick={() => setStepStatus('returned')} />
-              <Button fill large minimal icon="refresh" text="恢复为待复核" onClick={() => setStepStatus('submitted')} />
+              {selectedStep && (() => {
+                const stepState = process.reviewSession.stepStates[selectedStep.id];
+                if (!stepState) return null;
+                const mySeat = stepState.seats.some((s) => s.reviewerId === currentReviewer.id);
+                const depsMissing = selectedStep.dependencies.filter((depId) => process.reviewSession.stepStates[depId]?.status !== 'confirmed');
+                return (
+                  <>
+                    <div className="version-check">
+                      <div><span>步骤版本</span><Tag minimal>v{stepState.stepVersion}</Tag></div>
+                      <div><span>前置依赖</span>{depsMissing.length ? <Tag intent="danger">{depsMissing.length} 项未确认</Tag> : <Tag intent="success">已确认</Tag>}</div>
+                      <div><span>我的席位</span>{mySeat ? <Tag intent="primary">已领取</Tag> : <Tag minimal>未领取</Tag>}</div>
+                    </div>
+                    {!mySeat && (
+                      <Button fill icon="add" text="领取复核席位" onClick={claimSeatForReview} />
+                    )}
+                    <Button fill large intent="success" icon="tick" text="核对版本并确认" disabled={hasMissingSafety(selectedStep) || depsMissing.length > 0} onClick={() => setStepStatus('confirmed')} />
+                    <Button fill large icon="undo" text="退回修改" intent="warning" onClick={() => setStepStatus('returned')} />
+                    <Button fill large minimal icon="refresh" text="恢复为待复核" onClick={() => setStepStatus('submitted')} />
+                  </>
+                );
+              })()}
               <Divider />
               <div className="review-progress-list">
-                {process.steps.map((step) => <div key={step.id}><span>{step.title}</span><Tag minimal intent={step.status === 'confirmed' ? 'success' : step.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(step.status)}</Tag></div>)}
+                {process.steps.map((step) => {
+                  const ss = process.reviewSession.stepStates[step.id];
+                  const validCount = ss?.confirmations.filter((c) => c.valid).length ?? 0;
+                  return (
+                    <div key={step.id}><span>{step.title}</span>
+                      <span className="progress-tags">
+                        {ss?.status === 'invalidated' && <Tag intent="danger" minimal>已失效</Tag>}
+                        <Tag minimal>{validCount}/{REQUIRED_CONFIRMATIONS}</Tag>
+                        <Tag minimal intent={step.status === 'confirmed' ? 'success' : step.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(step.status)}</Tag>
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
-              <Button fill intent="primary" icon="lock" text="全部确认后冻结" onClick={freezeVersion} disabled={process.status === 'frozen'} />
+              <Button fill intent="primary" icon="lock" text="全部重核后冻结" onClick={freezeVersion} disabled={process.status === 'frozen'} />
             </Card>
           </aside>
         </main>
@@ -700,9 +1110,10 @@ function App() {
           <Card elevation={Elevation.ONE} className="freeze-rules">
             <div className="card-title"><div><span>FREEZE RULES</span><h3>冻结检查</h3></div></div>
             <div className={confirmedCount === process.steps.length ? 'passed' : ''}><Icon icon={confirmedCount === process.steps.length ? 'tick-circle' : 'circle'} /><span><strong>所有步骤已确认</strong><small>{confirmedCount}/{process.steps.length}</small></span></div>
+            <div className={!hasInvalidatedSteps ? 'passed' : ''}><Icon icon={!hasInvalidatedSteps ? 'tick-circle' : 'circle'} /><span><strong>无失效确认</strong><small>{hasInvalidatedSteps ? '有' : '无'} 步需重核</small></span></div>
             <div className={!missingSafetySteps.length ? 'passed' : ''}><Icon icon={!missingSafetySteps.length ? 'tick-circle' : 'circle'} /><span><strong>安全信息完整</strong><small>{missingSafetySteps.length} 个缺口</small></span></div>
             <div className={process.steps.every((step) => step.dependencies.every((id) => process.steps.some((item) => item.id === id))) ? 'passed' : ''}><Icon icon="git-merge" /><span><strong>依赖引用有效</strong><small>{process.steps.reduce((sum, step) => sum + step.dependencies.length, 0)} 条依赖</small></span></div>
-            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0} />
+            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || hasInvalidatedSteps || missingSafetySteps.length > 0} />
           </Card>
         </main>
       )}
@@ -731,6 +1142,17 @@ function collectDownstream(steps: ProcessStep[], sourceId: string | null): strin
   };
   visit(sourceId);
   return [...result];
+}
+
+// 从会话状态同步步骤缓存状态
+function syncStepStatus(draft: ExperimentProcess, stepId: string): void {
+  const step = draft.steps.find((s) => s.id === stepId);
+  const state = draft.reviewSession.stepStates[stepId];
+  if (!step || !state) return;
+  if (state.status === 'confirmed') step.status = 'confirmed';
+  else if (state.status === 'returned') step.status = 'returned';
+  else if (state.status === 'invalidated') step.status = 'submitted';
+  // open 状态保持原 draft/submitted
 }
 
 function nextMinorVersion(value: string): string {
